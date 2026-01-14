@@ -25,7 +25,7 @@ func main() {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
-	// objects registration(do not storage yet)
+	// POST /object
 	mux.HandleFunc("/objects", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
