@@ -34,6 +34,17 @@ type IndexEntry struct {
 	ModTime     time.Time `json:"mod_time"`
 }
 
+type ListResponse struct {
+	Objects []struct {
+		Key  string `json:"key"`
+		Size int64  `json:"size"`
+	} `json:"objects"`
+
+	CommonPrefixes []string `json:"common_prefixes"`
+	IsTruncated    bool     `json:"is_truncated"`
+	NextToken      string   `json:"next_continuation_token,omitempty"`
+}
+
 var idRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 var storeDir = getenv("STORE_DIR", "./store")
@@ -246,8 +257,15 @@ func openIndexDB(path string) (*bolt.DB, error) {
 }
 
 func handleObjectByKey(w http.ResponseWriter, r *http.Request) {
-	// /{bucket}/{key...}
 	path := strings.TrimPrefix(r.URL.Path, "/")
+
+	// --- LIST: GET /{bucket} ---
+	if r.Method == http.MethodGet && !strings.Contains(path, "/") {
+		handleListObjects(w, r)
+		return
+	}
+
+	// --- Object: /{bucket}/{key...} ---
 	parts := strings.SplitN(path, "/", 2)
 	if len(parts) != 2 {
 		http.Error(w, "invalid path", http.StatusBadRequest)
@@ -329,4 +347,79 @@ func handleObjectByKey(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func handleListObjects(w http.ResponseWriter, r *http.Request) {
+	bucket := strings.Trim(r.URL.Path, "/")
+
+	prefix := r.URL.Query().Get("prefix")
+	delimiter := r.URL.Query().Get("delimiter")
+
+	maxKeys := 1000
+	if v := r.URL.Query().Get("max-keys"); v != "" {
+		fmt.Sscanf(v, "%d", &maxKeys)
+	}
+
+	var resp ListResponse
+	prefixSet := make(map[string]struct{})
+
+	err := indexDB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("objects"))
+		c := b.Cursor()
+
+		seek := []byte(bucket + "/" + prefix)
+		for k, v := c.Seek(seek); k != nil; k, v = c.Next() {
+			key := string(k)
+
+			if !strings.HasPrefix(key, bucket+"/") {
+				break
+			}
+
+			objKey := strings.TrimPrefix(key, bucket+"/")
+			if !strings.HasPrefix(objKey, prefix) {
+				continue
+			}
+
+			rest := strings.TrimPrefix(objKey, prefix)
+
+			// delimiter 処理
+			if delimiter != "" {
+				if idx := strings.Index(rest, delimiter); idx >= 0 {
+					cp := prefix + rest[:idx+1]
+					prefixSet[cp] = struct{}{}
+					continue
+				}
+			}
+
+			var e IndexEntry
+			if err := json.Unmarshal(v, &e); err != nil {
+				continue
+			}
+
+			resp.Objects = append(resp.Objects, struct {
+				Key  string `json:"key"`
+				Size int64  `json:"size"`
+			}{
+				Key:  objKey,
+				Size: e.Size,
+			})
+
+			if len(resp.Objects) >= maxKeys {
+				resp.IsTruncated = true
+				break
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		http.Error(w, "list failed", http.StatusInternalServerError)
+		return
+	}
+
+	for p := range prefixSet {
+		resp.CommonPrefixes = append(resp.CommonPrefixes, p)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }

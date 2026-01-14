@@ -1,14 +1,203 @@
 # Gobject
 
-## Overview
+このドキュメントは、**単一ノード・HTTPベースのオブジェクトストレージ**における  
+**LIST を除く外部 API の仕様**を定義する。
 
-Gobject is a object storage which I created to practice Go language.
+内部実装（CAS / BoltDB / ファイル構成）は本仕様の対象外とする。
 
-## Features
+---
 
-### v0.1
+## 概要
 
-- implement basic HTTP server with net/http package
-  - support GET request to `/healthz` for health check
-  - support POST request to `/objects` for generate id by sha256 hash of content
-  - support GET request to `/objects/{id}` for retrieve object by id
+- 名前空間は **bucket / key** で構成される
+- オブジェクトは **不変の実体（content-addressed）**として保存される
+- API は HTTP/1.1 に準拠する
+- Range GET / HEAD をサポートする
+
+---
+
+## 用語
+
+|用語|意味|
+|---|---|
+|bucket|オブジェクトをまとめる名前空間|
+|key|bucket 内のオブジェクト名（`/` を含んでもよい）|
+|object|バイナリデータとそのメタデータ|
+|ETag|オブジェクト内容のハッシュ（sha256）|
+
+---
+
+## 認証（任意）
+
+すべての API は、必要に応じて認証を要求してよい。
+
+例（Bearer トークン）：
+
+`Authorization: Bearer <token>`
+
+未認証の場合、サーバは `401 Unauthorized` を返す。
+
+---
+
+## PUT Object
+
+### 概要
+
+オブジェクトを作成または上書きする。
+
+### リクエスト
+
+`PUT /{bucket}/{key}`
+
+#### ヘッダ
+
+|ヘッダ|必須|説明|
+|---|---|---|
+|Content-Type|任意|オブジェクトの MIME type|
+|Content-Length|任意|サイズ（不明でも可）|
+
+#### ボディ
+
+- 任意のバイナリデータ
+- ストリーミングアップロードをサポート
+
+### 振る舞い
+
+- 同じ内容の PUT は **冪等**である
+- PUT が成功した時点で、データは永続化されていることが保証される
+- オブジェクトは **即座に GET 可能**でなければならない
+
+### レスポンス
+
+`201 Created`
+
+#### ヘッダ
+
+|ヘッダ|説明|
+|---|---|
+|ETag|オブジェクトのハッシュ値|
+
+---
+
+## GET Object
+
+### 概要
+
+オブジェクトの内容を取得する。
+
+### リクエスト
+
+`GET /{bucket}/{key}`
+
+#### ヘッダ（任意）
+
+|ヘッダ|説明|
+|---|---|
+|Range|部分取得（RFC 7233）|
+
+### 振る舞い
+
+- オブジェクト全体または一部を返す
+- Range 指定時は `206 Partial Content` を返す
+- 存在しない場合は `404 Not Found`
+
+### レスポンス
+
+#### ステータス
+
+|状態|コード|
+|---|---|
+|成功|200 OK|
+|部分取得|206 Partial Content|
+|存在しない|404 Not Found|
+
+#### ヘッダ
+
+|ヘッダ|説明|
+|---|---|
+|Content-Type|保存時に検出された MIME type|
+|Content-Length|返却されるデータサイズ|
+|ETag|オブジェクトのハッシュ|
+|Last-Modified|最終更新時刻|
+|Accept-Ranges|`bytes`|
+
+---
+
+## HEAD Object
+
+### 概要
+
+オブジェクトのメタデータのみを取得する。
+
+### リクエスト
+
+`HEAD /{bucket}/{key}`
+
+### 振る舞い
+
+- GET と同じヘッダを返す
+- **レスポンスボディは返さない**
+
+### レスポンス
+
+`200 OK`
+
+#### ヘッダ
+
+- GET Object と同一
+
+---
+
+## DELETE Object
+
+### 概要
+
+オブジェクトを削除する。
+
+### リクエスト
+
+`DELETE /{bucket}/{key}`
+
+### 振る舞い
+
+- 削除は **名前（bucket/key）の削除**を意味する
+- 実体データの削除は即時に行われるとは限らない
+- 同じ DELETE を複数回行っても結果は変わらない（冪等）
+
+### レスポンス
+
+`204 No Content`
+
+---
+
+## エラー仕様
+
+### 共通エラーコード
+
+|コード|意味|
+|---|---|
+|400 Bad Request|リクエストが不正|
+|401 Unauthorized|認証失敗|
+|403 Forbidden|アクセス不可|
+|404 Not Found|オブジェクトが存在しない|
+|405 Method Not Allowed|許可されていないメソッド|
+|500 Internal Server Error|サーバ内部エラー|
+
+---
+
+## 非機能要件（保証事項）
+
+- **原子性**：部分的に書き込まれたオブジェクトが公開されることはない
+- **一貫性**：PUT 成功後、即座に GET 可能
+- **耐障害性**：プロセスクラッシュ後も破損しない
+- **スケーラビリティ**：オブジェクト数の増加に対して性能が極端に劣化しない
+
+---
+
+## 本仕様の対象外
+
+- LIST API（別途定義）
+- Multipart Upload
+- バージョニング
+- 分散・冗長化
+- S3 SigV4 互換
