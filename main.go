@@ -10,7 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 type PutResponse struct {
@@ -24,11 +27,27 @@ type Meta struct {
 	Size        int64  `json:"size"`
 }
 
+type IndexEntry struct {
+	SHA         string    `json:"sha"`
+	Size        int64     `json:"size"`
+	ContentType string    `json:"content_type"`
+	ModTime     time.Time `json:"mod_time"`
+}
+
 var idRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 var storeDir = getenv("STORE_DIR", "./store")
 
+var indexDB *bolt.DB
+
 func main() {
+	var err error
+	indexDB, err = openIndexDB(filepath.Join(storeDir, "index.db"))
+	if err != nil {
+		panic(err)
+	}
+	defer indexDB.Close()
+
 	if err := os.MkdirAll(storeDir, 0o755); err != nil {
 		panic(err)
 	}
@@ -108,6 +127,8 @@ func main() {
 		// ここが核心：Range/HEAD/206 を全部やってくれる
 		http.ServeContent(w, r, id, st.ModTime(), f)
 	})
+
+	mux.HandleFunc("/", handleObjectByKey)
 
 	addr := getenv("LISTEN_ADDR", ":8080")
 	fmt.Printf("listening on %s\n", addr)
@@ -210,4 +231,102 @@ func putAtomicStream(storeDir string, r io.Reader) (id string, size int64, ct st
 	}
 
 	return id, size, ct, nil
+}
+
+func openIndexDB(path string) (*bolt.DB, error) {
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		return nil, err
+	}
+	err = db.Update(func(tx *bolt.Tx) error {
+		_, e := tx.CreateBucketIfNotExists([]byte("objects"))
+		return e
+	})
+	return db, err
+}
+
+func handleObjectByKey(w http.ResponseWriter, r *http.Request) {
+	// /{bucket}/{key...}
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) != 2 {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	bucket, key := parts[0], parts[1]
+	indexKey := []byte(bucket + "/" + key)
+
+	switch r.Method {
+	case http.MethodPut:
+		defer r.Body.Close()
+
+		sha, size, ct, err := putAtomicStream(storeDir, r.Body)
+		if err != nil {
+			http.Error(w, "put failed", http.StatusInternalServerError)
+			return
+		}
+
+		entry := IndexEntry{
+			SHA:         sha,
+			Size:        size,
+			ContentType: ct,
+			ModTime:     time.Now().UTC(),
+		}
+		val, _ := json.Marshal(entry)
+
+		err = indexDB.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("objects"))
+			return b.Put(indexKey, val)
+		})
+		if err != nil {
+			http.Error(w, "index failed", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("ETag", sha)
+		w.WriteHeader(http.StatusCreated)
+		return
+	case http.MethodGet, http.MethodHead:
+		var entry IndexEntry
+		err := indexDB.View(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("objects"))
+			v := b.Get(indexKey)
+			if v == nil {
+				return os.ErrNotExist
+			}
+			return json.Unmarshal(v, &entry)
+		})
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		f, err := os.Open(filepath.Join(storeDir, entry.SHA+".blob"))
+		if err != nil {
+			http.Error(w, "blob missing", http.StatusInternalServerError)
+			return
+		}
+		defer f.Close()
+
+		w.Header().Set("Content-Type", entry.ContentType)
+		w.Header().Set("ETag", entry.SHA)
+
+		_, _ = f.Stat()
+		http.ServeContent(w, r, key, entry.ModTime, f)
+		return
+	case http.MethodDelete:
+		err := indexDB.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("objects"))
+			return b.Delete(indexKey)
+		})
+		if err != nil {
+			http.Error(w, "delete failed", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
