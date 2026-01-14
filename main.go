@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
 	"time"
 )
 
@@ -16,7 +18,14 @@ type PutResponse struct {
 	Size int64  `json:"size"`
 }
 
+var idRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 func main() {
+	storeDir := getenv("STORE_DIR", "./store")
+	if err := os.MkdirAll(storeDir, 0o755); err != nil {
+		panic(err)
+	}
+
 	mux := http.NewServeMux()
 
 	// health check
@@ -45,12 +54,52 @@ func main() {
 		}
 		sum := sha256.Sum256(b)
 		id := hex.EncodeToString(sum[:])
+
+		path := filepath.Join(storeDir, id+".blob")
+
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if err := os.WriteFile(path, b, 0o644); err != nil {
+				http.Error(w, "failed to write file", http.StatusInternalServerError)
+				return
+			}
+		}
+
 		resp := PutResponse{
 			ID:   id,
 			Size: int64(len(b)),
 		}
+
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	// GET /objects/{id}
+	mux.HandleFunc("/objects/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		id := filepath.Base(r.URL.Path)
+		if !idRe.MatchString(id) {
+			http.Error(w, "invalid id", http.StatusBadGateway)
+			return
+		}
+
+		path := filepath.Join(storeDir, id+".blob")
+		f, err := os.Open(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, "failed to open file", http.StatusNotFound)
+			return
+		}
+		defer f.Close()
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = io.Copy(w, f)
 	})
 
 	addr := getenv("LISTEN_ADDR", ":8080")
