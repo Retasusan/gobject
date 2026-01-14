@@ -20,8 +20,9 @@ type PutResponse struct {
 
 var idRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+var storeDir = getenv("STORE_DIR", "./store")
+
 func main() {
-	storeDir := getenv("STORE_DIR", "./store")
 	if err := os.MkdirAll(storeDir, 0o755); err != nil {
 		panic(err)
 	}
@@ -55,13 +56,9 @@ func main() {
 		sum := sha256.Sum256(b)
 		id := hex.EncodeToString(sum[:])
 
-		path := filepath.Join(storeDir, id+".blob")
-
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			if err := os.WriteFile(path, b, 0o644); err != nil {
-				http.Error(w, "failed to write file", http.StatusInternalServerError)
-				return
-			}
+		if err := putAtomic(storeDir, id, b); err != nil {
+			http.Error(w, "failed to store object", http.StatusInternalServerError)
+			return
 		}
 
 		resp := PutResponse{
@@ -113,9 +110,56 @@ func main() {
 		panic(err)
 	}
 }
+
 func getenv(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
 	}
 	return def
+}
+
+func putAtomic(storeDir, id string, b []byte) error {
+	finalPath := filepath.Join(storeDir, id+".blob")
+
+	// 冪等: return success if already exists
+	if _, err := os.Stat(finalPath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	//tmp directory
+	tmpDir := filepath.Join(storeDir, "tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return err
+	}
+
+	//create tmp file
+	f, err := os.CreateTemp(tmpDir, "put-*.tmp")
+	if err != nil {
+		return nil
+	}
+	tmpName := f.Name()
+
+	// cleaning when failed
+	defer func() {
+		f.Close()
+		os.Remove(tmpName)
+	}()
+
+	//write
+	if _, err := f.Write(b); err != nil {
+		return err
+	}
+
+	// ensure to close disc
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	//publish as atomic
+	return os.Rename(tmpName, finalPath)
 }
